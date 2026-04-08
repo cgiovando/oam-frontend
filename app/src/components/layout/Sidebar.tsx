@@ -28,15 +28,22 @@ export default function Sidebar() {
     }
   }, [features, selectedFeature]);
 
-  // Scroll selected card into view
+  // #6: expand visible count to include selected item, then scroll to it
   useEffect(() => {
     if (!selectedFeature || !listRef.current) return;
-    const id = selectedFeature.properties._id as string;
-    const el = document.getElementById(`card-${id}`);
-    if (el) {
-      el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    const selectedId = selectedFeature.properties._id as string;
+    const idx = features.findIndex((f) => f.properties._id === selectedId);
+    if (idx >= 0 && idx >= visibleCount) {
+      setVisibleCount(idx + 1);
     }
-  }, [selectedFeature]);
+    // Wait for render then scroll
+    requestAnimationFrame(() => {
+      const el = document.getElementById(`card-${selectedId}`);
+      if (el) {
+        el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      }
+    });
+  }, [selectedFeature, features, visibleCount]);
 
   const visibleFeatures = features.slice(0, visibleCount);
   const hasMore = features.length > visibleCount;

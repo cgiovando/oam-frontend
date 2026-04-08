@@ -17,24 +17,52 @@ import {
 import { getTmsUrl, bboxAreaKm2, getCogBoundsUrl } from '../../utils/tiles';
 import { buildMaplibreFilter, matchesFilters } from '../../utils/filters';
 import { readUrlState } from '../../utils/url';
+import { bboxFromGeometry, validateCoord } from '../../utils/geo';
 import type { MapGeoJSONFeature } from 'maplibre-gl';
 
-// Cache COG bounds to avoid repeated fetches
-const cogBoundsCache: Record<string, { bounds: [number, number, number, number]; area: number } | null> = {};
+// #8: COG bounds cache with failure retry and LRU eviction
+const COG_CACHE_MAX = 500;
+const COG_FAILURE_TTL = 30_000; // retry failures after 30s
+const cogBoundsCache = new Map<
+  string,
+  { bounds: [number, number, number, number]; area: number } | { failedAt: number } | 'pending'
+>();
 
-async function fetchCogBounds(cogUrl: string): Promise<{ bounds: [number, number, number, number]; area: number } | null> {
-  const cacheKey = cogUrl;
-  if (cacheKey in cogBoundsCache) return cogBoundsCache[cacheKey];
+function evictOldest() {
+  if (cogBoundsCache.size <= COG_CACHE_MAX) return;
+  const firstKey = cogBoundsCache.keys().next().value;
+  if (firstKey) cogBoundsCache.delete(firstKey);
+}
+
+async function fetchCogBounds(
+  cogUrl: string
+): Promise<{ bounds: [number, number, number, number]; area: number } | null> {
+  const cached = cogBoundsCache.get(cogUrl);
+  if (cached && cached !== 'pending') {
+    if ('failedAt' in cached) {
+      if (Date.now() - cached.failedAt < COG_FAILURE_TTL) return null;
+      // TTL expired, retry
+    } else {
+      return cached;
+    }
+  }
+  if (cached === 'pending') return null; // dedupe in-flight
+
+  cogBoundsCache.set(cogUrl, 'pending');
   try {
     const resp = await fetch(getCogBoundsUrl(cogUrl));
-    if (!resp.ok) { cogBoundsCache[cacheKey] = null; return null; }
+    if (!resp.ok) {
+      cogBoundsCache.set(cogUrl, { failedAt: Date.now() });
+      return null;
+    }
     const data = await resp.json();
     const b = data.bounds as [number, number, number, number];
     const result = { bounds: b, area: bboxAreaKm2(b) };
-    cogBoundsCache[cacheKey] = result;
+    evictOldest();
+    cogBoundsCache.set(cogUrl, result);
     return result;
   } catch {
-    cogBoundsCache[cacheKey] = null;
+    cogBoundsCache.set(cogUrl, { failedAt: Date.now() });
     return null;
   }
 }
@@ -43,6 +71,8 @@ export default function MapView() {
   const mapContainer = useRef<HTMLDivElement>(null);
   const map = useRef<maplibregl.Map | null>(null);
   const [mapLoaded, setMapLoaded] = useState(false);
+  // #9: track unmount to ignore async completions
+  const unmountedRef = useRef(false);
 
   const setView = useStore((s) => s.setView);
   const setFeatures = useStore((s) => s.setFeatures);
@@ -54,16 +84,56 @@ export default function MapView() {
   const filtersRef = useRef(useStore.getState().filters);
   const selectedRef = useRef(useStore.getState().selectedFeature);
   useEffect(() => {
-    return useStore.subscribe((state) => {
+    const unsub = useStore.subscribe((state) => {
       filtersRef.current = state.filters;
       selectedRef.current = state.selectedFeature;
     });
+    return unsub;
   }, []);
 
   // Active TMS layer tracking
   const activeTmsLayers = useRef<Set<string>>(new Set());
   // Suppress TMS updates during fly animations to prevent flash
   const flyingRef = useRef(false);
+  // #9: track timers for cleanup
+  const timersRef = useRef<Set<number>>(new Set());
+
+  const safeTimeout = useCallback((fn: () => void, ms: number): number => {
+    const id = window.setTimeout(() => {
+      timersRef.current.delete(id);
+      if (!unmountedRef.current) fn();
+    }, ms);
+    timersRef.current.add(id);
+    return id;
+  }, []);
+
+  // #2: manage selected feature state on map
+  const prevSelectedIdRef = useRef<string | number | null>(null);
+  const syncSelectedState = useCallback(() => {
+    const m = map.current;
+    if (!m || !m.getSource('oam-pmtiles')) return;
+    const selected = selectedRef.current;
+    const prevId = prevSelectedIdRef.current;
+    const newId = selected?.id ?? null;
+    if (prevId === newId) return;
+    if (prevId != null) {
+      try {
+        m.setFeatureState(
+          { source: 'oam-pmtiles', sourceLayer: 'images', id: prevId },
+          { selected: false }
+        );
+      } catch { /* feature may no longer be loaded */ }
+    }
+    if (newId != null) {
+      try {
+        m.setFeatureState(
+          { source: 'oam-pmtiles', sourceLayer: 'images', id: newId },
+          { selected: true }
+        );
+      } catch { /* feature may not be loaded yet */ }
+    }
+    prevSelectedIdRef.current = newId;
+  }, []);
 
   const removeTmsLayer = useCallback((id: string) => {
     const m = map.current;
@@ -75,81 +145,77 @@ export default function MapView() {
     activeTmsLayers.current.delete(id);
   }, []);
 
-  const addTmsLayer = useCallback(async (
-    feature: MapGeoJSONFeature,
-    isSelected: boolean
-  ) => {
-    const m = map.current;
-    if (!m) return;
-    const id = feature.properties._id as string;
-    if (activeTmsLayers.current.has(id)) {
-      // Update opacity if needed
-      const layerId = `tms-${id}`;
-      if (m.getLayer(layerId)) {
-        m.setPaintProperty(layerId, 'raster-opacity', isSelected ? 1.0 : 0.6);
+  const addTmsLayer = useCallback(
+    async (feature: MapGeoJSONFeature, isSelected: boolean) => {
+      const m = map.current;
+      if (!m || unmountedRef.current) return;
+      const id = feature.properties._id as string;
+      if (activeTmsLayers.current.has(id)) {
+        const layerId = `tms-${id}`;
+        if (m.getLayer(layerId)) {
+          m.setPaintProperty(layerId, 'raster-opacity', isSelected ? 1.0 : 0.6);
+        }
+        return;
       }
-      return;
-    }
-    if (!isSelected && activeTmsLayers.current.size >= MAX_TMS_LAYERS) return;
+      if (!isSelected && activeTmsLayers.current.size >= MAX_TMS_LAYERS) return;
 
-    const tmsUrl = getTmsUrl(feature.properties as Record<string, unknown>);
-    if (!tmsUrl) return;
+      const tmsUrl = getTmsUrl(feature.properties as Record<string, unknown>);
+      if (!tmsUrl) return;
 
-    // Get COG bounds for constraining tile requests
-    const cogUrl = feature.properties.uuid as string;
-    let bounds: [number, number, number, number] | undefined;
-    if (cogUrl) {
-      const info = await fetchCogBounds(cogUrl);
-      if (info) bounds = info.bounds;
-    }
+      // Get COG bounds for constraining tile requests
+      const cogUrl = feature.properties.uuid as string;
+      let bounds: [number, number, number, number] | undefined;
+      if (cogUrl) {
+        const info = await fetchCogBounds(cogUrl);
+        if (unmountedRef.current) return; // #9: check after async
+        if (info) bounds = info.bounds;
+      }
 
-    // Feature's bbox from geometry as fallback
-    if (!bounds && feature.geometry.type === 'Polygon') {
-      const coords = (feature.geometry as GeoJSON.Polygon).coordinates[0];
-      const lons = coords.map(c => c[0]);
-      const lats = coords.map(c => c[1]);
-      bounds = [Math.min(...lons), Math.min(...lats), Math.max(...lons), Math.max(...lats)];
-    }
+      // #10: use geometry-agnostic bbox as fallback
+      if (!bounds && feature.geometry) {
+        const geoBbox = bboxFromGeometry(feature.geometry);
+        if (geoBbox) bounds = geoBbox;
+      }
 
-    const sourceId = `tms-src-${id}`;
-    const layerId = `tms-${id}`;
+      const sourceId = `tms-src-${id}`;
+      const layerId = `tms-${id}`;
 
-    if (m.getSource(sourceId)) return;
+      if (!m || m.getSource(sourceId)) return;
 
-    m.addSource(sourceId, {
-      type: 'raster',
-      tiles: [tmsUrl],
-      tileSize: 256,
-      minzoom: isSelected ? TMS_SELECTED_MIN_ZOOM : TMS_LARGE_MIN_ZOOM,
-      maxzoom: 22,
-      ...(bounds ? { bounds } : {}),
-    });
-
-    m.addLayer(
-      {
-        id: layerId,
+      m.addSource(sourceId, {
         type: 'raster',
-        source: sourceId,
-        paint: {
-          'raster-opacity': isSelected ? 1.0 : 0.6,
+        tiles: [tmsUrl],
+        tileSize: 256,
+        minzoom: isSelected ? TMS_SELECTED_MIN_ZOOM : TMS_LARGE_MIN_ZOOM,
+        maxzoom: 22,
+        ...(bounds ? { bounds } : {}),
+      });
+
+      m.addLayer(
+        {
+          id: layerId,
+          type: 'raster',
+          source: sourceId,
+          paint: { 'raster-opacity': isSelected ? 1.0 : 0.6 },
         },
-      },
-      'footprint-fill' // insert below footprint layers
-    );
+        'footprint-fill'
+      );
 
-    activeTmsLayers.current.add(id);
-  }, []);
+      activeTmsLayers.current.add(id);
+    },
+    []
+  );
 
-  // Emit visible features from PMTiles
+  // #1: use queryRenderedFeatures instead of querySourceFeatures
   const emitVisibleFeatures = useCallback(() => {
     const m = map.current;
-    if (!m || !m.getSource('oam-pmtiles')) return;
+    if (!m || !m.getLayer('footprint-fill')) return;
 
-    const features = m.querySourceFeatures('oam-pmtiles', {
-      sourceLayer: 'images',
+    const features = m.queryRenderedFeatures(undefined, {
+      layers: ['footprint-fill'],
     });
 
-    // Deduplicate by id
+    // Deduplicate by _id
     const seen = new Set<string>();
     const unique: MapGeoJSONFeature[] = [];
     for (const f of features) {
@@ -157,14 +223,14 @@ export default function MapView() {
       if (!id || seen.has(id)) continue;
       seen.add(id);
       if (matchesFilters(f.properties as Record<string, unknown>, filtersRef.current)) {
-        unique.push(f as MapGeoJSONFeature);
+        unique.push(f);
       }
     }
 
     // Sort by date descending
     unique.sort((a, b) => {
-      const da = (a.properties.acquisition_end as string) || '';
-      const db = (b.properties.acquisition_end as string) || '';
+      const da = (a.properties.acquisition_end as string) || (a.properties.datetime as string) || '';
+      const db = (b.properties.acquisition_end as string) || (b.properties.datetime as string) || '';
       return db.localeCompare(da);
     });
 
@@ -179,20 +245,17 @@ export default function MapView() {
     const features = useStore.getState().features;
     const selected = selectedRef.current;
 
-    // Remove layers for features no longer visible
-    const visibleIds = new Set(features.map(f => f.properties._id as string));
+    const visibleIds = new Set(features.map((f) => f.properties._id as string));
     for (const id of activeTmsLayers.current) {
       if (!visibleIds.has(id) && id !== selected?.properties?._id) {
         removeTmsLayer(id);
       }
     }
 
-    // Add selected image TMS
     if (selected && zoom >= TMS_SELECTED_MIN_ZOOM) {
       addTmsLayer(selected, true);
     }
 
-    // Add large images at mid zoom
     if (zoom >= TMS_LARGE_MIN_ZOOM) {
       for (const f of features) {
         if (activeTmsLayers.current.size >= MAX_TMS_LAYERS) break;
@@ -209,7 +272,6 @@ export default function MapView() {
       }
     }
 
-    // At low zoom, remove all non-selected TMS layers
     if (zoom < TMS_LARGE_MIN_ZOOM) {
       for (const id of activeTmsLayers.current) {
         if (id !== selected?.properties?._id) {
@@ -222,16 +284,16 @@ export default function MapView() {
   // Initialize map
   useEffect(() => {
     if (!mapContainer.current || map.current) return;
+    unmountedRef.current = false;
 
     const protocol = new Protocol();
     maplibregl.addProtocol('pmtiles', protocol.tile);
 
+    // #7: validate URL params
     const urlState = readUrlState();
-    const center: [number, number] =
-      urlState.lon != null && urlState.lat != null
-        ? [urlState.lon, urlState.lat]
-        : [0, 20];
-    const zoom = urlState.zoom ?? 2;
+    const validated = validateCoord(urlState.lat, urlState.lon, urlState.zoom);
+    const center: [number, number] = validated ? [validated.lon, validated.lat] : [0, 20];
+    const zoom = validated?.zoom ?? 2;
 
     const m = new maplibregl.Map({
       container: mapContainer.current,
@@ -246,16 +308,13 @@ export default function MapView() {
     m.addControl(new maplibregl.NavigationControl(), 'bottom-right');
 
     m.on('load', () => {
-      // PMTiles vector source
+      if (unmountedRef.current) return;
+
       m.addSource('oam-pmtiles', {
         type: 'vector',
         url: PMTILES_URL,
       });
 
-      // Grid layer (low zoom - aggregated counts)
-      // For now, just use footprints at all zooms; grid aggregation is Phase 2
-
-      // Footprint fill layer
       m.addLayer({
         id: 'footprint-fill',
         type: 'fill',
@@ -271,15 +330,10 @@ export default function MapView() {
             '#ff6b6b',
             'rgba(65, 105, 225, 0.15)',
           ],
-          'fill-opacity': [
-            'interpolate', ['linear'], ['zoom'],
-            8, 0.4,
-            14, 0.1,
-          ],
+          'fill-opacity': ['interpolate', ['linear'], ['zoom'], 8, 0.4, 14, 0.1],
         },
       });
 
-      // Footprint outline layer
       m.addLayer({
         id: 'footprint-line',
         type: 'line',
@@ -308,18 +362,15 @@ export default function MapView() {
 
       setMapLoaded(true);
 
-      // Emit features on idle (skip during fly animations)
       m.on('idle', () => {
-        if (flyingRef.current) return;
+        if (flyingRef.current || unmountedRef.current) return;
         emitVisibleFeatures();
         updateTmsLayers();
+        syncSelectedState();
       });
 
-      // Update view state on moveend
-      let moveTimer: number;
       m.on('moveend', () => {
-        clearTimeout(moveTimer);
-        moveTimer = window.setTimeout(() => {
+        safeTimeout(() => {
           if (flyingRef.current) return;
           const c = m.getCenter();
           setView([c.lng, c.lat], m.getZoom());
@@ -331,12 +382,10 @@ export default function MapView() {
       // Click handler
       m.on('click', 'footprint-fill', (e) => {
         if (e.features && e.features.length > 0) {
-          const feature = e.features[0] as MapGeoJSONFeature;
-          setSelectedFeature(feature);
+          setSelectedFeature(e.features[0] as MapGeoJSONFeature);
         }
       });
 
-      // Click on empty space deselects
       m.on('click', (e) => {
         const features = m.queryRenderedFeatures(e.point, {
           layers: ['footprint-fill'],
@@ -347,27 +396,29 @@ export default function MapView() {
       });
 
       // Hover
-      let hoveredId: string | null = null;
+      let hoveredId: string | number | null = null;
       m.on('mousemove', 'footprint-fill', (e) => {
         if (e.features && e.features.length > 0) {
-          if (hoveredId) {
+          if (hoveredId != null) {
             m.setFeatureState(
               { source: 'oam-pmtiles', sourceLayer: 'images', id: hoveredId },
               { hover: false }
             );
           }
-          hoveredId = e.features[0].id as string;
-          m.setFeatureState(
-            { source: 'oam-pmtiles', sourceLayer: 'images', id: hoveredId },
-            { hover: true }
-          );
+          hoveredId = e.features[0].id ?? null;
+          if (hoveredId != null) {
+            m.setFeatureState(
+              { source: 'oam-pmtiles', sourceLayer: 'images', id: hoveredId },
+              { hover: true }
+            );
+          }
           setHoveredFeatureId(e.features[0].properties._id as string);
           m.getCanvas().style.cursor = 'pointer';
         }
       });
 
       m.on('mouseleave', 'footprint-fill', () => {
-        if (hoveredId) {
+        if (hoveredId != null) {
           m.setFeatureState(
             { source: 'oam-pmtiles', sourceLayer: 'images', id: hoveredId },
             { hover: false }
@@ -377,17 +428,37 @@ export default function MapView() {
         setHoveredFeatureId(null);
         m.getCanvas().style.cursor = '';
       });
+
+      // #2: restore selected_id from URL after features first load
+      const urlSelectedId = urlState.selectedId;
+      if (urlSelectedId) {
+        const restoreSelection = () => {
+          const features = useStore.getState().features;
+          const match = features.find((f) => f.properties._id === urlSelectedId);
+          if (match) {
+            setSelectedFeature(match);
+            m.off('idle', restoreSelection);
+          }
+        };
+        m.on('idle', restoreSelection);
+        // Give up after 10s
+        safeTimeout(() => m.off('idle', restoreSelection), 10_000);
+      }
     });
 
     map.current = m;
-    // Expose for debugging
     (window as unknown as Record<string, unknown>).__map = m;
 
+    // #9: cleanup all timers and mark unmounted
     return () => {
+      unmountedRef.current = true;
+      for (const id of timersRef.current) clearTimeout(id);
+      timersRef.current.clear();
       maplibregl.removeProtocol('pmtiles');
       m.remove();
       map.current = null;
     };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   // Apply filter expression when filters change
@@ -403,52 +474,47 @@ export default function MapView() {
           // eslint-disable-next-line @typescript-eslint/no-explicit-any
           m.setFilter('footprint-line', expr as any);
         }
-        // Re-emit visible features after filter change
-        setTimeout(() => {
+        safeTimeout(() => {
           emitVisibleFeatures();
           updateTmsLayers();
         }, 100);
       }
     });
     return sub;
-  }, [mapLoaded, emitVisibleFeatures, updateTmsLayers]);
+  }, [mapLoaded, emitVisibleFeatures, updateTmsLayers, safeTimeout]);
 
-  // Fly to selected feature
+  // #2: sync selected feature state + fly to it
   useEffect(() => {
     if (!map.current || !mapLoaded) return;
     const sub = useStore.subscribe((state, prev) => {
-      if (state.selectedFeature !== prev.selectedFeature && state.selectedFeature) {
+      if (state.selectedFeature !== prev.selectedFeature) {
+        syncSelectedState();
         const f = state.selectedFeature;
-        if (f.geometry.type === 'Polygon') {
-          const coords = (f.geometry as GeoJSON.Polygon).coordinates[0];
-          const lons = coords.map(c => c[0]);
-          const lats = coords.map(c => c[1]);
-          const bounds: [[number, number], [number, number]] = [
-            [Math.min(...lons), Math.min(...lats)],
-            [Math.max(...lons), Math.max(...lats)],
-          ];
-          // Suppress TMS updates during the fly animation
-          flyingRef.current = true;
-          const m = map.current!;
-          m.once('moveend', () => {
-            // Small delay to let the final render settle
-            setTimeout(() => {
-              flyingRef.current = false;
-              emitVisibleFeatures();
-              updateTmsLayers();
-            }, 200);
-          });
-          m.fitBounds(bounds, { padding: 100, maxZoom: 16 });
+        if (f?.geometry) {
+          // #10: geometry-agnostic bbox
+          const bbox = bboxFromGeometry(f.geometry);
+          if (bbox) {
+            flyingRef.current = true;
+            const m = map.current!;
+            m.once('moveend', () => {
+              safeTimeout(() => {
+                flyingRef.current = false;
+                emitVisibleFeatures();
+                updateTmsLayers();
+              }, 200);
+            });
+            m.fitBounds(
+              [[bbox[0], bbox[1]], [bbox[2], bbox[3]]],
+              { padding: 100, maxZoom: 16 }
+            );
+          }
         }
       }
     });
     return sub;
-  }, [mapLoaded, updateTmsLayers, emitVisibleFeatures]);
+  }, [mapLoaded, updateTmsLayers, emitVisibleFeatures, syncSelectedState, safeTimeout]);
 
   return (
-    <div
-      ref={mapContainer}
-      style={{ position: 'absolute', inset: 0 }}
-    />
+    <div ref={mapContainer} style={{ position: 'absolute', inset: 0 }} />
   );
 }

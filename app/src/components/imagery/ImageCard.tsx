@@ -1,5 +1,6 @@
 import { useStore } from '../../stores';
 import { getTmsUrl, getPreviewUrl, getCogUrl } from '../../utils/tiles';
+import { isAllowedAssetUrl, bboxFromGeometry } from '../../utils/geo';
 import type { MapGeoJSONFeature } from 'maplibre-gl';
 
 interface Props {
@@ -15,7 +16,9 @@ export default function ImageCard({ feature }: Props) {
   const isSelected = selectedFeature?.properties?._id === p._id;
   const isHovered = hoveredFeatureId === p._id;
 
-  const cogUrl = getCogUrl(p);
+  // #5: only use URLs from allowlisted domains
+  const rawCogUrl = getCogUrl(p);
+  const cogUrl = rawCogUrl && isAllowedAssetUrl(rawCogUrl) ? rawCogUrl : null;
   const thumbnailUrl = cogUrl ? getPreviewUrl(cogUrl, 256) : null;
   const tmsUrl = getTmsUrl(p);
 
@@ -35,28 +38,24 @@ export default function ImageCard({ feature }: Props) {
     if (tmsUrl) navigator.clipboard.writeText(tmsUrl);
   };
 
+  // #10: geometry-agnostic bbox for editor links
+  const bbox = feature.geometry ? bboxFromGeometry(feature.geometry) : null;
+
   const openInId = () => {
-    if (!tmsUrl || !feature.geometry) return;
-    const coords = (feature.geometry as GeoJSON.Polygon).coordinates[0];
-    const lons = coords.map((c) => c[0]);
-    const lats = coords.map((c) => c[1]);
-    const cx = (Math.min(...lons) + Math.max(...lons)) / 2;
-    const cy = (Math.min(...lats) + Math.max(...lats)) / 2;
+    if (!tmsUrl || !bbox) return;
+    const cx = (bbox[0] + bbox[2]) / 2;
+    const cy = (bbox[1] + bbox[3]) / 2;
     const url = `https://www.openstreetmap.org/edit?editor=id#map=16/${cy.toFixed(5)}/${cx.toFixed(5)}&background=custom:${encodeURIComponent(tmsUrl)}`;
-    window.open(url, '_blank');
+    window.open(url, '_blank', 'noopener,noreferrer');
   };
 
   const openInJosm = () => {
-    if (!tmsUrl || !feature.geometry) return;
-    const coords = (feature.geometry as GeoJSON.Polygon).coordinates[0];
-    const lons = coords.map((c) => c[0]);
-    const lats = coords.map((c) => c[1]);
+    if (!tmsUrl || !bbox) return;
     const josmUrl = `http://127.0.0.1:8111/imagery?title=OAM&type=tms&url=${encodeURIComponent(tmsUrl)}`;
     fetch(josmUrl).catch(() => {
       window.alert('JOSM does not appear to be running. Please start JOSM and enable Remote Control.');
     });
-    // Also zoom JOSM to the image
-    const zoomUrl = `http://127.0.0.1:8111/zoom?left=${Math.min(...lons)}&right=${Math.max(...lons)}&top=${Math.max(...lats)}&bottom=${Math.min(...lats)}`;
+    const zoomUrl = `http://127.0.0.1:8111/zoom?left=${bbox[0]}&right=${bbox[2]}&top=${bbox[3]}&bottom=${bbox[1]}`;
     setTimeout(() => fetch(zoomUrl).catch(() => {}), 500);
   };
 
@@ -129,7 +128,7 @@ export default function ImageCard({ feature }: Props) {
           {/* Action buttons */}
           <div className="flex gap-2 mt-3 flex-wrap">
             {cogUrl && (
-              <ActionButton onClick={() => window.open(cogUrl, '_blank')}>
+              <ActionButton onClick={() => window.open(cogUrl, '_blank', 'noopener,noreferrer')}>
                 Download
               </ActionButton>
             )}

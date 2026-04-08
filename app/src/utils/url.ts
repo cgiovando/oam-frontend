@@ -1,12 +1,13 @@
 /**
  * Read all relevant state from URL query params.
+ * #7: Returns validated values; invalid/NaN values become null.
  */
 export function readUrlState() {
   const params = new URLSearchParams(window.location.search);
   return {
-    lat: params.has('lat') ? parseFloat(params.get('lat')!) : null,
-    lon: params.has('lon') ? parseFloat(params.get('lon')!) : null,
-    zoom: params.has('zoom') ? parseFloat(params.get('zoom')!) : null,
+    lat: safeParseFloat(params.get('lat')),
+    lon: safeParseFloat(params.get('lon')),
+    zoom: safeParseFloat(params.get('zoom')),
     selectedId: params.get('selected_id') || null,
     dateStart: params.get('dateStart') || '',
     dateEnd: params.get('dateEnd') || '',
@@ -14,6 +15,12 @@ export function readUrlState() {
     resolution: params.get('resolution') || '',
     license: params.get('license') || '',
   };
+}
+
+function safeParseFloat(value: string | null): number | null {
+  if (value == null) return null;
+  const n = parseFloat(value);
+  return Number.isFinite(n) ? n : null;
 }
 
 /**
