@@ -8,7 +8,7 @@ export const PMTILES_URL =
 
 // Zoom thresholds (proven in oam-vibe)
 export const GRID_MAX_ZOOM = 9;
-export const FOOTPRINT_MIN_ZOOM = 8;
+export const FOOTPRINT_MIN_ZOOM = 0;
 export const TMS_LARGE_MIN_ZOOM = 12;
 export const TMS_ALL_MIN_ZOOM = 16;
 export const TMS_SELECTED_MIN_ZOOM = 10;
